@@ -13,7 +13,7 @@ class TurnTaking:
         status_callback=None,
         transcription_callback=None,
         circle_callback=None,
-        server_url="ws://localhost:8000/turn",
+        server_url="ws://localhost:8010/turn",
         client_id=None,
         timeout=1.0,
     ):

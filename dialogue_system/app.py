@@ -17,6 +17,7 @@ from starlette.websockets import WebSocketState
 from clients.tts_client import IndexTTS_VLLM, Cosyvoice_Streaming_VLLM
 from clients.llm_client import QwenLLM_stream
 from clients.vad_client import TurnTaking
+from clients.flashhead_client import FlashHeadClient
 from modules.utils.backchannel_utils import check_backchannel
 
 logging.basicConfig(
@@ -52,6 +53,7 @@ class Config:
     SAMPLE_RATE = 16000
     VAD_POOL_SIZE = 10
     PORT = 55556
+    FLASHHEAD_URL = "http://localhost:6008"   # FlashHead 服务地址
 
 
 class ChatSession:
@@ -81,6 +83,7 @@ class ChatSession:
     def interrupt(self):
         """Interrupts current inference or audio playback."""
         self._stop_event.set()
+        flashhead.interrupt(self.client_id)
         emit_to_room(self.client_id, "stop_audio", {"message": "interrupt"})
         emit_to_room(self.client_id, "circle_status", {"status": "LISTENING"})
 
@@ -149,8 +152,9 @@ session_manager = SessionManager()
 llm = QwenLLM_stream()
 # tts = Cosyvoice_Streaming_VLLM()
 tts = IndexTTS_VLLM()
+flashhead = FlashHeadClient(api_url=Config.FLASHHEAD_URL)
 asr = None  # Placeholder for ASR client if transcription isn't handled within VAD
-print("System initialized: VAD Pool, LLM client, TTS client ready.")
+print("System initialized: VAD Pool, LLM client, TTS client, FlashHead client ready.")
 
 
 def emit_to_room(client_id, event, data):
@@ -263,6 +267,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         interrupted = False
         first_emit_time = None
         total_audio_duration = 0.0
+        speaking_notified = False  # 只通知一次 SPEAKING 状态
 
         for i, chunk in enumerate(
             llm_reply_gen
@@ -290,11 +295,17 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                 if first_emit_time is None:
                     first_emit_time = time.time()
 
+                # 通知前端数字人开始说话（只发一次）
+                if not speaking_notified:
+                    emit_to_room(client_id, "circle_status", {"status": "SPEAKING"})
+                    speaking_notified = True
+
                 # Calculate audio duration: bytes / (sample_rate * channels * bytes_per_sample)
                 # Assuming 24k sample rate, 1 channel, 16-bit (2 bytes) = 48000 bytes/sec
                 total_audio_duration += len(wav_chunk) / 48000.0
 
-                emit_to_room(client_id, "audio_chunk", wav_chunk)
+                # 推给 FlashHead（而非直接发给浏览器）
+                flashhead.push_audio(client_id, wav_chunk)
 
             if current_stop_event.is_set():
                 interrupted = True
@@ -438,6 +449,33 @@ async def websocket_endpoint(websocket: WebSocket):
                         if sr:
                             session.input_sample_rate = int(sr)
                             logger.info(f"[{client_id}] Sample rate set to {sr}")
+
+                    elif event == "webrtc_offer":
+                        # 浏览器发来 WebRTC offer，转发给 FlashHead，返回 answer
+                        offer_data = payload
+                        loop = asyncio.get_running_loop()
+                        answer = await loop.run_in_executor(
+                            None,
+                            flashhead.send_offer,
+                            client_id,
+                            offer_data.get("sdp", ""),
+                            offer_data.get("type", "offer"),
+                            offer_data.get("cond_image"),
+                        )
+                        if answer:
+                            emit_to_room(client_id, "webrtc_answer", answer)
+                        else:
+                            emit_to_room(client_id, "webrtc_error", {"message": "FlashHead offer failed"})
+
+                    elif event == "webrtc_candidate":
+                        # 浏览器发来 ICE candidate，转发给 FlashHead
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(
+                            None,
+                            flashhead.send_candidate,
+                            client_id,
+                            payload,
+                        )
 
                 except json.JSONDecodeError:
                     logger.warning(f"[{client_id}] Received invalid JSON")

@@ -6,4 +6,4 @@ cd ${root_dir}/modules/qwen_llm
 python llm_server.py \
     --host 0.0.0.0 \
     --port 6007 \
-    --model_dir ${root_dir}/../pretrained_models/Qwen2.5-7B-Instruct
+    --model_dir /data/models/Qwen2.5-7B-Instruct

@@ -4,6 +4,8 @@ const voiceCircle = document.getElementById('voiceCircle');
 const circleStatusEl = document.getElementById('circleStatus');
 const waveformCanvas = document.getElementById('waveformCanvas');
 const ctx = waveformCanvas.getContext('2d');
+const digitalHumanVideo = document.getElementById('digitalHumanVideo');
+const videoPlaceholder = document.getElementById('videoPlaceholder');
 
 waveformCanvas.width = waveformCanvas.clientWidth;
 waveformCanvas.height = 100;
@@ -12,106 +14,181 @@ let audioContext, analyser, dataArray, source, stream, processor;
 let animationId = null;
 let listening = false;
 
-// --- ASR Audio Context is separate from TTS Audio Context ---
-let ttsContext = null;
-let ttsNode = null;
-let ttsSab = null;
-let ttsFloat32Data = null;
-let ttsStates = null; // Int32Array [writeIndex, readIndex]
-// Buffer size: capacity for ~120 seconds at 24k
-const TTS_BUFFER_SIZE = 24000 * 120;
-
-// ==================== Native WebSocket ====================
-// Determine protocol (ws or wss)
+// ==================== WebSocket ====================
 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = `${protocol}//${window.location.host}/ws`;
 
 let socket = new WebSocket(wsUrl);
-socket.binaryType = 'arraybuffer'; // Important for receiving audio
+socket.binaryType = 'arraybuffer';
 
-socket.onopen = () => {
-  console.log('[WebSocket] connected');
-};
+socket.onopen = () => console.log('[WebSocket] connected');
+socket.onclose = () => console.log('[WebSocket] disconnected');
+socket.onerror = (error) => console.error('[WebSocket] error:', error);
 
-socket.onclose = () => {
-  console.log('[WebSocket] disconnected');
-};
+// ==================== WebRTC ====================
+let pc = null;
 
-socket.onerror = (error) => {
-  console.error('[WebSocket] error:', error);
-};
-
-// Handle incoming messages
-socket.onmessage = (event) => {
-  const data = event.data;
-
-  // Check if data is binary (Audio Chunk)
-  if (data instanceof ArrayBuffer) {
-    handleAudioChunk(data);
-    return;
+async function initWebRTC() {
+  if (pc) {
+    pc.close();
+    pc = null;
   }
 
-  // Otherwise handle JSON messages
-  try {
-    const msg = JSON.parse(data);
-    const eventName = msg.event;
-    const payload = msg.data;
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  });
 
-    switch (eventName) {
-      case 'connect_ack':
-        console.log('Connection confirmed:', payload);
-        break;
-      case 'text_response':
-        console.log('[LLM]', payload.text);
-        break;
-      case 'vad_loading':
-        handleVadLoading(payload);
-        break;
-      case 'vad_status':
-        if (vadStatusEl) {
-          vadStatusEl.textContent = payload.message || payload.state || "Unknown Status";
-          vadStatusEl.dataset.state = payload.state || "idle";
-        }
-        break;
-      case 'circle_status':
-        updateCircleState(payload.status);
-        break;
-      case 'user_transcription':
-        handleUserTranscription(payload);
-        break;
-      case 'stop_audio':
-        console.log('Received stop_audio signal');
-        if (ttsNode) ttsNode.port.postMessage({ type: 'abort' });
-        updateCircleState("LISTENING");
-        break;
-      case 'pause_audio':
-        if (ttsNode) ttsNode.port.postMessage({ type: 'pause' });
-        updateCircleState("LISTENING");
-        break;
-      case 'resume_audio':
-        if (ttsNode) ttsNode.port.postMessage({ type: 'resume' });
-        updateCircleState('SPEAKING');
-        break;
-      default:
-        console.log('Unknown event:', eventName);
+  // 收到媒体流（数字人视频 + 音频）
+  pc.ontrack = (event) => {
+    console.log('[WebRTC] received track:', event.track.kind);
+    if (event.streams && event.streams[0]) {
+      digitalHumanVideo.srcObject = event.streams[0];
+      digitalHumanVideo.play().catch(e => console.warn('[WebRTC] video play error:', e));
+      videoPlaceholder.style.display = 'none';
     }
-  } catch (e) {
-    console.error('Failed to parse message:', e);
+  };
+
+  // 将 ICE candidate 通过 WebSocket 转发给 app.py
+  pc.onicecandidate = (event) => {
+    if (event.candidate && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        event: 'webrtc_candidate',
+        data: {
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+        },
+      }));
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log('[WebRTC] connection state:', pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      console.log('[WebRTC] digital human connected');
+    }
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      videoPlaceholder.style.display = 'flex';
+    }
+  };
+
+  // 创建 offer 并发给 app.py
+  const offer = await pc.createOffer({
+    offerToReceiveAudio: true,
+    offerToReceiveVideo: true,
+  });
+  await pc.setLocalDescription(offer);
+
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({
+      event: 'webrtc_offer',
+      data: { sdp: offer.sdp, type: offer.type },
+    }));
+    console.log('[WebRTC] offer sent');
+  } else {
+    console.error('[WebRTC] WebSocket not open, cannot send offer');
   }
-};
+}
 
-
-// DOM elements
+// ==================== DOM elements ====================
 const vadStatusEl = document.getElementById("vadStatus");
 const userTranscriptionEl = document.getElementById("userTranscription");
-
-// Loading Overlay Elements
 const loadingOverlay = document.getElementById("loadingOverlay");
 const loadingMessage = document.getElementById("loadingMessage");
 const loadingConfirmBtn = document.getElementById("loadingConfirmBtn");
 const loadingSpinner = document.querySelector(".loading-spinner");
 const loadingSuccess = document.querySelector(".loading-success");
 
+// ==================== WebSocket 消息处理 ====================
+socket.onmessage = (event) => {
+  const data = event.data;
+
+  // 不再处理二进制音频（音频已通过 WebRTC 播放）
+  if (data instanceof ArrayBuffer) {
+    return;
+  }
+
+  let msg;
+  try {
+    msg = JSON.parse(data);
+  } catch (e) {
+    console.error('Failed to parse message:', e);
+    return;
+  }
+
+  const eventName = msg.event;
+  const payload = msg.data;
+
+  switch (eventName) {
+    case 'connect_ack':
+      console.log('Connection confirmed:', payload);
+      break;
+
+    case 'text_response':
+      console.log('[LLM]', payload.text);
+      break;
+
+    case 'vad_loading':
+      handleVadLoading(payload);
+      break;
+
+    case 'vad_status':
+      if (vadStatusEl) {
+        vadStatusEl.textContent = payload.message || payload.state || "Unknown Status";
+        vadStatusEl.dataset.state = payload.state || "idle";
+      }
+      break;
+
+    case 'circle_status':
+      updateCircleState(payload.status);
+      break;
+
+    case 'user_transcription':
+      handleUserTranscription(payload);
+      break;
+
+    case 'stop_audio':
+      // 数字人停止说话（由 FlashHead 端处理帧停止）
+      updateCircleState("LISTENING");
+      break;
+
+    // ── WebRTC 信令 ──────────────────────────────────────────────────────────
+
+    case 'webrtc_answer':
+      // 收到 FlashHead 的 answer，完成 WebRTC 握手
+      (async () => {
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription({
+            sdp: payload.sdp,
+            type: payload.type,
+          }));
+          console.log('[WebRTC] remote description set (answer)');
+        } catch (e) {
+          console.error('[WebRTC] setRemoteDescription error:', e);
+        }
+      })();
+      break;
+
+    case 'webrtc_candidate':
+      // 收到服务端的 ICE candidate（trickleless ICE 下通常不会收到）
+      if (pc && payload && payload.candidate) {
+        pc.addIceCandidate(new RTCIceCandidate(payload)).catch(e =>
+          console.warn('[WebRTC] addIceCandidate error:', e)
+        );
+      }
+      break;
+
+    case 'webrtc_error':
+      console.error('[WebRTC] server error:', payload.message);
+      videoPlaceholder.style.display = 'flex';
+      break;
+
+    default:
+      console.log('Unknown event:', eventName);
+  }
+};
+
+// ==================== Loading Overlay ====================
 function handleVadLoading({ state, message }) {
   loadingOverlay.classList.remove("hidden");
   loadingMessage.textContent = message;
@@ -127,117 +204,27 @@ function handleVadLoading({ state, message }) {
   }
 }
 
-// Close loading overlay
+// 点击「Start Experience」后关闭 overlay，发起 WebRTC
 loadingConfirmBtn.addEventListener("click", async () => {
   loadingOverlay.classList.add("hidden");
   updateCircleState("READY");
-
-  // Initialize TTS Audio Engine
-  if (!ttsContext) {
-    await initTTSAudioEngine();
-  }
+  await initWebRTC();
 });
 
+// ==================== Transcription ====================
 function handleUserTranscription({ text }) {
   if (!userTranscriptionEl) return;
-
-  // Truncate logic: keep last N chars if too long
   const MAX_LEN = 20;
   let displayText = text || "No transcription yet";
   if (displayText.length > MAX_LEN) {
     let tail = displayText.slice(-MAX_LEN);
-
-    // Ensure we don't cut off in the middle of a word
     const match = tail.match(/^[a-zA-Z]+/);
-    if (match) {
-      const extraLen = match[0].length;
-      tail = displayText.slice(-(MAX_LEN + extraLen));
-    }
-
+    if (match) tail = displayText.slice(-(MAX_LEN + match[0].length));
     displayText = "..." + tail;
   }
-
   userTranscriptionEl.textContent = displayText;
   userTranscriptionEl.classList.add("updated");
   window.setTimeout(() => userTranscriptionEl.classList.remove("updated"), 400);
-}
-
-// ==================== TTS Engine (SharedArrayBuffer + AudioWorklet) ====================
-async function initTTSAudioEngine() {
-  try {
-    // Create context with TTS specific sample rate (24k)
-    ttsContext = new AudioContext({ sampleRate: 24000, latencyHint: 'interactive' });
-
-    // Add AudioWorklet Module
-    await ttsContext.audioWorklet.addModule('processor.js');
-
-    // Initialize SharedArrayBuffer
-    // Header (8 bytes) + Data (Float32 * SIZE)
-    const sabSize = 8 + TTS_BUFFER_SIZE * 4;
-    ttsSab = new SharedArrayBuffer(sabSize);
-
-    // Views
-    ttsStates = new Int32Array(ttsSab, 0, 2); // [0]: WriteIndex, [1]: ReadIndex
-    ttsFloat32Data = new Float32Array(ttsSab, 8);
-
-    // Init Indices
-    Atomics.store(ttsStates, 0, 0);
-    Atomics.store(ttsStates, 1, 0);
-
-    // Create Worklet Node
-    ttsNode = new AudioWorkletNode(ttsContext, 'tts-processor', {
-      processorOptions: { sab: ttsSab }
-    });
-
-    // Handle messages from Worklet (e.g., playback finished)
-    ttsNode.port.onmessage = (e) => {
-      if (e.data.type === 'playback_ended') {
-        updateCircleState('LISTENING');
-        console.log('[TTS] playback finished');
-      }
-    };
-
-    ttsNode.connect(ttsContext.destination);
-    console.log("TTS Audio Engine Initialized");
-
-  } catch (e) {
-    console.error("Failed to init TTS Engine:", e);
-    alert("Audio Engine initialization failed! Only supported in localhost or https. Check console for details.");
-  }
-}
-
-// Handle Receive Audio Chunk (Binary)
-function handleAudioChunk(arrayBuffer) {
-  if (!ttsSab || !ttsFloat32Data) return;
-
-  // Resume context if suspended
-  if (ttsContext.state === 'suspended') {
-    ttsContext.resume();
-  }
-
-  // Convert incoming Int16 PCM to Float32
-  // Assuming backend sends raw Int16 bytes from WAV
-  const inputInt16 = new Int16Array(arrayBuffer);
-  const inputLen = inputInt16.length;
-
-  // Load current Write Index
-  let writeIndex = Atomics.load(ttsStates, 0);
-
-  for (let i = 0; i < inputLen; i++) {
-    // Normalize Int16 to Float32 [-1, 1]
-    const sample = inputInt16[i] / 32768.0;
-
-    // Circular buffer write
-    const bufferIndex = writeIndex % TTS_BUFFER_SIZE;
-    ttsFloat32Data[bufferIndex] = sample;
-
-    writeIndex++;
-  }
-
-  // Update Write Index atomically
-  Atomics.store(ttsStates, 0, writeIndex);
-
-  updateCircleState('SPEAKING');
 }
 
 // ==================== Audio Capture ====================
@@ -246,16 +233,10 @@ startBtn.addEventListener('click', async () => {
     listening = true;
     updateCircleState("LISTENING");
 
-    // Ensure TTS Engine is ready
-    if (!ttsContext) await initTTSAudioEngine();
-    if (ttsContext.state === 'suspended') ttsContext.resume();
-
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-    // Separate context for recording to avoid sample rate mess
     audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
 
-    // Send Audio Configuration
+    // 发送采样率配置
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({
         event: "config_audio",
@@ -263,17 +244,13 @@ startBtn.addEventListener('click', async () => {
       }));
     }
 
-    // Ensure AudioContext is active (required by some browser policies)
-    if (audioContext.state === 'suspended') {
-      await audioContext.resume();
-    }
+    if (audioContext.state === 'suspended') await audioContext.resume();
 
     source = audioContext.createMediaStreamSource(stream);
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 512;
     dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-    // Create ScriptProcessor to send in frames
     processor = audioContext.createScriptProcessor(512, 1, 1);
     source.connect(analyser);
     source.connect(processor);
@@ -282,13 +259,10 @@ startBtn.addEventListener('click', async () => {
     processor.onaudioprocess = e => {
       if (!listening) return;
       const input = e.inputBuffer.getChannelData(0);
-      // Float32 -> Int16
       const int16 = new Int16Array(input.length);
       for (let i = 0; i < input.length; i++) {
         int16[i] = Math.max(-1, Math.min(1, input[i])) * 0x7fff;
       }
-
-      // Native WebSocket Send (Binary)
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(int16.buffer);
       }
@@ -310,13 +284,9 @@ startBtn.addEventListener('click', async () => {
 stopBtn.addEventListener('click', () => {
   listening = false;
 
-  // Send Stop signal via JSON
   if (socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ event: 'duplex_stop' }));
   }
-
-  // Interrupt TTS
-  if (ttsNode) ttsNode.port.postMessage({ type: 'abort' });
 
   cancelAnimationFrame(animationId);
   if (stream) stream.getTracks().forEach(t => t.stop());
@@ -363,7 +333,6 @@ function pulseAssistantCircle() {
   if (!listening) return;
   animationId = requestAnimationFrame(pulseAssistantCircle);
 
-  // Only animate scale via JS if NOT in CSS-animated states (like speaking/processing)
   if (voiceCircle.classList.contains('state-speaking') || voiceCircle.classList.contains('state-processing')) {
     return;
   }
@@ -377,27 +346,22 @@ function pulseAssistantCircle() {
 
 // ==================== Update Circle State ====================
 function updateCircleState(state) {
-  // Reset classes
   voiceCircle.classList.remove('state-speaking', 'state-listening', 'state-processing');
 
   let statusText = "READY";
-
   switch (state) {
     case 'LISTENING':
       voiceCircle.classList.add('state-listening');
       statusText = "LISTENING";
       break;
-
     case 'THINKING':
       voiceCircle.classList.add('state-processing');
       statusText = "THINKING";
       break;
-
     case 'SPEAKING':
       voiceCircle.classList.add('state-speaking');
       statusText = "SPEAKING";
       break;
-
     case 'READY':
     default:
       statusText = "READY";

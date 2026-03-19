@@ -1,14 +1,14 @@
 model_config:
   task: state_prediction
 
-  glm_tokenizer_path: pretrained_models/glm-4-voice-tokenizer
+  glm_tokenizer_path: /data/models/SoulX-Duplug-0.6B/glm-4-voice-tokenizer
   enable_lora: true
   lora_r: 32
   lora_alpha: 64
 
-  model_name: pretrained_models/Qwen3-0.6B-expand_vocab_v2
+  model_name: /data/models/SoulX-Duplug-0.6B/Qwen3-0.6B-expand_vocab_v2
   llm_dim: 1024
-  init_ckpt_path_lora: pretrained_models/SoulX-Duplug/SoulX-Duplug-0.6B-Bilingual.pth
+  init_ckpt_path_lora: /data/models/SoulX-Duplug-0.6B/SoulX-Duplug/SoulX-Duplug-0.6B-Bilingual.pth
 
 infer_config:
   seed: 42

@@ -6,8 +6,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Full-Duplex Speech Dialogue</title>
   <link rel="stylesheet" href="style.css">
-  <!-- <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script> -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js" crossorigin="anonymous"></script>
 </head>
 
 <body>
@@ -42,6 +40,15 @@
       <span class="hero-tag">Testing</span>
       <h1>SoulX-Duplug Demo</h1>
     </div>
+
+    <!-- 数字人视频区域 -->
+    <div class="digital-human-container">
+      <video id="digitalHumanVideo" autoplay playsinline muted="false"></video>
+      <div id="videoPlaceholder" class="video-placeholder">
+        <span>Digital Human Loading...</span>
+      </div>
+    </div>
+
     <div class="circle-container">
       <div id="voiceCircle" class="voice-circle">
         <span id="circleStatus" class="circle-status">READY</span>

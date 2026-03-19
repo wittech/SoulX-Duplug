@@ -37,7 +37,7 @@ class ModelConfig:
     # model config
     audio_embed_dim: int = 1280
     llm_dim: int = 2048
-    glm_tokenizer_path: str = "pretrained_models/glm-4-voice-tokenizer"
+    glm_tokenizer_path: str = "/data/models/SoulX-Duplug-0.6B/glm-4-voice-tokenizer"
     model_name: str = "pretrained_models/Qwen3-1.7B-expand_vocab_v2"
     init_ckpt_path: str = ""
     init_ckpt_path_lora: str = ""
