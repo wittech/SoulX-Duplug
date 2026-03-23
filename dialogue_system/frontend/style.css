@@ -32,11 +32,25 @@ body {
   flex-shrink: 0;
 }
 
-.digital-human-container video {
+.digital-human-container video,
+.digital-human-container canvas {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+.digital-human-container video.dh-video-active {
+  opacity: 1;
+  z-index: 2;
+}
+
+.digital-human-container video.dh-video-inactive {
+  opacity: 0;
+  z-index: 1;
+  pointer-events: none;
 }
 
 .video-placeholder {
@@ -45,9 +59,14 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #64748b;
+  color: #e2e8f0;
+  text-shadow: 0 1px 4px rgba(15, 23, 42, 0.85);
   font-size: 14px;
-  background: #1e293b;
+  background-color: #1e293b;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+  z-index: 3;
 }
 
 /* ===== Loading Overlay ===== */

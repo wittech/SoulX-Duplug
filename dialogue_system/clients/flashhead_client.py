@@ -2,9 +2,9 @@
 FlashHead 客户端
 
 供 dialogue_system/app.py 调用，负责：
-  1. 中转 WebRTC 信令（offer / candidate）
-  2. 将 TTS 音频推送给 FlashHead 服务
-  3. 打断当前会话推理
+  1. 将 TTS 音频推送给 FlashHead 服务
+  2. 打断当前会话推理
+  3. 提供浏览器直连 WebSocket 的 URL
 """
 
 import logging
@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 class FlashHeadClient:
     def __init__(self, api_url: str = "http://localhost:6008"):
         self.api_url = api_url.rstrip("/")
+        # WebSocket URL 供前端直连（http→ws, https→wss）
+        self.ws_url = self.api_url.replace("http://", "ws://").replace("https://", "wss://")
         # 启动时探活
         try:
             resp = requests.get(f"{self.api_url}/health", timeout=5)
@@ -25,45 +27,6 @@ class FlashHeadClient:
                 logger.warning(f"[FlashHeadClient] Health check failed: {resp.status_code}")
         except Exception as e:
             logger.warning(f"[FlashHeadClient] Cannot reach FlashHead service: {e}")
-
-    def send_offer(
-        self,
-        client_id: str,
-        sdp: str,
-        sdp_type: str,
-        cond_image: str = None,
-    ) -> dict:
-        """
-        将浏览器的 WebRTC offer 转发给 FlashHead，返回 answer。
-
-        Returns:
-            {"sdp": ..., "type": "answer"}
-        """
-        payload = {"client_id": client_id, "sdp": sdp, "type": sdp_type}
-        if cond_image:
-            payload["cond_image"] = cond_image
-        try:
-            resp = requests.post(
-                f"{self.api_url}/offer",
-                json=payload,
-                timeout=30,   # ICE gathering 最多等 10s，再加处理余量
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"[FlashHeadClient] send_offer failed: {e}")
-            return {}
-
-    def send_candidate(self, client_id: str, candidate: dict) -> None:
-        """将浏览器的 ICE candidate 转发给 FlashHead。"""
-        try:
-            requests.post(
-                f"{self.api_url}/candidate",
-                json={"client_id": client_id, "candidate": candidate},
-                timeout=5,
-            )
-        except Exception as e:
-            logger.warning(f"[FlashHeadClient] send_candidate failed: {e}")
 
     def push_audio(self, client_id: str, pcm_bytes: bytes) -> None:
         """
@@ -81,6 +44,16 @@ class FlashHeadClient:
             )
         except Exception as e:
             logger.warning(f"[FlashHeadClient] push_audio failed: {e}")
+
+    def flush(self, client_id: str) -> None:
+        """TTS 音频发送完毕，通知 FlashHead 刷新剩余帧为最后一段 MP4。"""
+        try:
+            requests.post(
+                f"{self.api_url}/flush/{client_id}",
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"[FlashHeadClient] flush failed: {e}")
 
     def interrupt(self, client_id: str) -> None:
         """通知 FlashHead 停止当前会话的推理。"""

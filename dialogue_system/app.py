@@ -9,10 +9,13 @@ import uuid
 import json
 import asyncio
 import numpy as np
+import requests
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
+import websockets as ws_lib
 
 from clients.tts_client import IndexTTS_VLLM, Cosyvoice_Streaming_VLLM
 from clients.llm_client import QwenLLM_stream
@@ -184,6 +187,41 @@ def emit_to_room(client_id, event, data):
     asyncio.run_coroutine_threadsafe(_send(), main_loop)
 
 
+async def flashhead_proxy(client_id: str, browser_ws: WebSocket, fh_url: str):
+    """
+    服务端内部代理：连接 FlashHead WebSocket，将媒体帧转发给浏览器。
+    浏览器无需直连 FlashHead 端口，所有媒体流通过主 WebSocket 传输。
+    注意：FlashHead 可能晚于主服务启动，这里必须持续重连，
+    否则首轮连接失败后整个会话都收不到视频。
+    """
+    while browser_ws.client_state == WebSocketState.CONNECTED:
+        fh_ws = None
+        try:
+            fh_ws = await ws_lib.connect(fh_url, ping_interval=None, open_timeout=5)
+            logger.info(f"[{client_id}] FlashHead proxy connected")
+
+            async for message in fh_ws:
+                if not isinstance(message, bytes):
+                    continue
+                if browser_ws.client_state != WebSocketState.CONNECTED:
+                    break
+                await browser_ws.send_bytes(message)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"[{client_id}] FlashHead proxy reconnecting: {e}")
+            await asyncio.sleep(1.0)
+        finally:
+            if fh_ws is not None:
+                try:
+                    await fh_ws.close()
+                except Exception:
+                    pass
+
+    logger.info(f"[{client_id}] FlashHead proxy closed")
+
+
 def pipeline_worker(client_id, audio_segment, sample_rate):
     """
     Main processing pipeline: ASR -> LLM -> TTS.
@@ -311,6 +349,19 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                 interrupted = True
                 break
 
+        # TTS 全部发送完毕，通知 FlashHead 刷新剩余帧为最后一段 MP4
+        if not interrupted:
+            if hasattr(flashhead, "flush"):
+                flashhead.flush(client_id)
+            else:
+                logger.warning(
+                    "[FlashHeadClient] flush method missing, fallback to direct /flush call"
+                )
+                try:
+                    requests.post(f"{Config.FLASHHEAD_URL}/flush/{client_id}", timeout=10)
+                except Exception as e:
+                    logger.warning(f"[FlashHeadClient] fallback flush failed: {e}")
+
         if interrupted:
             # If interrupted mid-stream, calculate truncation immediately using current time
             if first_emit_time and total_audio_duration > 0:
@@ -355,6 +406,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"New connection: {client_id}")
 
     session = None
+    proxy_task = None
 
     try:
         # Initial Handshake / Setup
@@ -390,6 +442,12 @@ async def websocket_endpoint(websocket: WebSocket):
         )
         logger.info(f"Session initialized for {client_id}")
 
+        # 启动 FlashHead 媒体代理（服务端内部连接 FlashHead WS，转发给浏览器）
+        fh_ws_url = f"{flashhead.ws_url}/ws/{client_id}"
+        proxy_task = asyncio.create_task(
+            flashhead_proxy(client_id, websocket, fh_ws_url)
+        )
+
         while True:
             # Receive Message
             try:
@@ -397,6 +455,11 @@ async def websocket_endpoint(websocket: WebSocket):
             except WebSocketDisconnect:
                 logger.info(f"Client disconnected: {client_id}")
                 break
+            except RuntimeError as e:
+                if 'disconnect message has been received' in str(e):
+                    logger.info(f"Client disconnected: {client_id}")
+                    break
+                raise
 
             if "bytes" in message and message["bytes"]:
                 # Binary Audio Data
@@ -417,10 +480,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if segment is not None:
                     if isinstance(segment, list) and segment[0] is None:
-                        # Barge-in
+                        # Barge-in：只在第一帧触发打断，避免每帧都调用 interrupt()
                         if session.interruption_time is None:
                             session.interruption_time = time.time()
-                        session.interrupt()
+                            session.interrupt()
                     else:
                         # Complete Utterance
                         threading.Thread(
@@ -438,7 +501,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if event == "duplex_stop":
                         if session.interruption_time is None:
                             session.interruption_time = time.time()
-                        session.stop_event.set()
+                        session.interrupt()
                         session.reset_interrupt()
                         logger.info(f"Session manually stopped by client: {client_id}")
 
@@ -450,32 +513,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             session.input_sample_rate = int(sr)
                             logger.info(f"[{client_id}] Sample rate set to {sr}")
 
-                    elif event == "webrtc_offer":
-                        # 浏览器发来 WebRTC offer，转发给 FlashHead，返回 answer
-                        offer_data = payload
-                        loop = asyncio.get_running_loop()
-                        answer = await loop.run_in_executor(
-                            None,
-                            flashhead.send_offer,
-                            client_id,
-                            offer_data.get("sdp", ""),
-                            offer_data.get("type", "offer"),
-                            offer_data.get("cond_image"),
-                        )
-                        if answer:
-                            emit_to_room(client_id, "webrtc_answer", answer)
-                        else:
-                            emit_to_room(client_id, "webrtc_error", {"message": "FlashHead offer failed"})
-
-                    elif event == "webrtc_candidate":
-                        # 浏览器发来 ICE candidate，转发给 FlashHead
-                        loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(
-                            None,
-                            flashhead.send_candidate,
-                            client_id,
-                            payload,
-                        )
 
                 except json.JSONDecodeError:
                     logger.warning(f"[{client_id}] Received invalid JSON")
@@ -485,6 +522,12 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
+        # 取消 FlashHead 代理任务
+        if proxy_task is not None:
+            try:
+                proxy_task.cancel()
+            except Exception:
+                pass
         if session:
             session.is_active = False
             session.stop_event.set()
@@ -494,6 +537,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ==== Static Resource Routing ====
+@app.get("/avatar/default")
+async def default_avatar():
+    return FileResponse("modules/FlashHead/examples/girl.png")
+
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 

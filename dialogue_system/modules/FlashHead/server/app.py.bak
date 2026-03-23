@@ -66,10 +66,6 @@ OUTPUT_MAX_EDGE = int(os.getenv("FLASHHEAD_OUTPUT_MAX_EDGE", "0"))
 # x264 编码参数（影响码率与解码压力）
 ENCODE_PRESET = os.getenv("FLASHHEAD_ENCODE_PRESET", "veryfast")
 ENCODE_CRF = int(os.getenv("FLASHHEAD_ENCODE_CRF", "30"))
-MP4_MOVFLAGS = os.getenv(
-    "FLASHHEAD_MP4_MOVFLAGS",
-    "empty_moov+default_base_moof+frag_keyframe",
-)
 
 # flush 哨兵：放入 _audio_in_queue 表示 TTS 已结束
 _FLUSH_SENTINEL = object()
@@ -202,7 +198,8 @@ def _encode_segment(
             "-i", temp_audio,
             "-c:v", "copy",
             "-c:a", "aac",
-            "-movflags", MP4_MOVFLAGS,
+            "-shortest",
+            "-movflags", "+faststart",
             out_mp4,
         ]
         result = subprocess.run(cmd, capture_output=True)
@@ -632,7 +629,7 @@ def create_app(cfg: ServerConfig) -> FastAPI:
             "[FlashHead] Stream config: "
             f"out_fps={OUTPUT_FPS}, first_seg={FIRST_SEGMENT_CHUNKS}, "
             f"steady_seg={STEADY_SEGMENT_CHUNKS}, max_edge={OUTPUT_MAX_EDGE}, "
-            f"preset={ENCODE_PRESET}, crf={ENCODE_CRF}, movflags={MP4_MOVFLAGS}"
+            f"preset={ENCODE_PRESET}, crf={ENCODE_CRF}"
         )
 
         # 预热推理（触发 torch.compile，消除用户首次 ~30s 等待）

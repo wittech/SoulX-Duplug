@@ -6,15 +6,33 @@ const waveformCanvas = document.getElementById('waveformCanvas');
 const ctx = waveformCanvas.getContext('2d');
 const digitalHumanVideo = document.getElementById('digitalHumanVideo');
 const videoPlaceholder = document.getElementById('videoPlaceholder');
+const activeVideo = digitalHumanVideo;
+
+if (videoPlaceholder) {
+  videoPlaceholder.style.backgroundImage = "url('/avatar/default')";
+}
+
+function showDefaultAvatar() {
+  if (videoPlaceholder) {
+    videoPlaceholder.style.display = 'flex';
+  }
+}
+
+function hideDefaultAvatar() {
+  if (videoPlaceholder) {
+    videoPlaceholder.style.display = 'none';
+  }
+}
 
 waveformCanvas.width = waveformCanvas.clientWidth;
 waveformCanvas.height = 100;
 
 let audioContext, analyser, dataArray, source, stream, processor;
+let silentGain;
 let animationId = null;
 let listening = false;
 
-// ==================== WebSocket ====================
+// ==================== 主控 WebSocket ====================
 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = `${protocol}//${window.location.host}/ws`;
 
@@ -25,69 +43,390 @@ socket.onopen = () => console.log('[WebSocket] connected');
 socket.onclose = () => console.log('[WebSocket] disconnected');
 socket.onerror = (error) => console.error('[WebSocket] error:', error);
 
-// ==================== WebRTC ====================
-let pc = null;
+const MSE_CODEC_CANDIDATES = [
+  'video/mp4; codecs="avc1.42E01E,mp4a.40.2"',
+  'video/mp4; codecs="avc1.4D401E,mp4a.40.2"',
+  'video/mp4; codecs="avc1.64001F,mp4a.40.2"',
+  'video/mp4'
+];
+const MSE_START_BUFFER_SEC = 0.35;
+const MSE_KEEP_BUFFER_SEC = 8;
 
-async function initWebRTC() {
-  if (pc) {
-    pc.close();
-    pc = null;
+let mediaSource = null;
+let sourceBuffer = null;
+let mseObjectUrl = null;
+let mseCodec = null;
+let mseOpened = false;
+let mseAppendQueue = [];
+let mseAppending = false;
+let mseGeneration = 0;
+let acceptIncomingMedia = false;
+let pendingTurnReset = false;
+let mseConsecutiveAppendErrors = 0;
+let mseLastChunkAt = 0;
+let mseLastUpdateEndAt = Date.now();
+let mseRecovering = false;
+let mseHealthTimer = null;
+let firstFrameRevealArmed = false;
+let firstFrameFallbackTimer = null;
+let firstFrameRvfcToken = null;
+let firstChunkSeenGeneration = -1;
+
+const MSE_HEALTH_CHECK_MS = 800;
+const MSE_MAX_APPEND_ERRORS = 3;
+const MSE_UPDATE_STUCK_MS = 3000;
+const MSE_QUEUE_STUCK_MS = 1800;
+const MSE_STREAM_FINISHED_IDLE_MS = 1200;
+
+function clearFirstFrameRevealWatchers() {
+  if (!activeVideo) return;
+  activeVideo.removeEventListener('loadeddata', onFirstFrameMaybeVisible);
+  activeVideo.removeEventListener('canplay', onFirstFrameMaybeVisible);
+  activeVideo.removeEventListener('playing', onFirstFrameMaybeVisible);
+  activeVideo.removeEventListener('timeupdate', onFirstFrameMaybeVisible);
+
+  if (firstFrameFallbackTimer) {
+    clearTimeout(firstFrameFallbackTimer);
+    firstFrameFallbackTimer = null;
   }
 
-  pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-  });
-
-  // 收到媒体流（数字人视频 + 音频）
-  pc.ontrack = (event) => {
-    console.log('[WebRTC] received track:', event.track.kind);
-    if (event.streams && event.streams[0]) {
-      digitalHumanVideo.srcObject = event.streams[0];
-      digitalHumanVideo.play().catch(e => console.warn('[WebRTC] video play error:', e));
-      videoPlaceholder.style.display = 'none';
+  if (firstFrameRvfcToken !== null && typeof activeVideo.cancelVideoFrameCallback === 'function') {
+    try {
+      activeVideo.cancelVideoFrameCallback(firstFrameRvfcToken);
+    } catch (_e) {
     }
-  };
-
-  // 将 ICE candidate 通过 WebSocket 转发给 app.py
-  pc.onicecandidate = (event) => {
-    if (event.candidate && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({
-        event: 'webrtc_candidate',
-        data: {
-          candidate: event.candidate.candidate,
-          sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-        },
-      }));
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    console.log('[WebRTC] connection state:', pc.connectionState);
-    if (pc.connectionState === 'connected') {
-      console.log('[WebRTC] digital human connected');
-    }
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-      videoPlaceholder.style.display = 'flex';
-    }
-  };
-
-  // 创建 offer 并发给 app.py
-  const offer = await pc.createOffer({
-    offerToReceiveAudio: true,
-    offerToReceiveVideo: true,
-  });
-  await pc.setLocalDescription(offer);
-
-  if (socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({
-      event: 'webrtc_offer',
-      data: { sdp: offer.sdp, type: offer.type },
-    }));
-    console.log('[WebRTC] offer sent');
-  } else {
-    console.error('[WebRTC] WebSocket not open, cannot send offer');
+    firstFrameRvfcToken = null;
   }
+}
+
+function onFirstFrameMaybeVisible() {
+  if (!firstFrameRevealArmed || !acceptIncomingMedia || !activeVideo) return;
+  if (firstChunkSeenGeneration !== mseGeneration) return;
+  const ready = activeVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+  const moved = activeVideo.currentTime > 0;
+  const visibleLikely = activeVideo.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA && !activeVideo.paused;
+
+  if (!ready || (!moved && !visibleLikely)) {
+    return;
+  }
+
+  firstFrameRevealArmed = false;
+  clearFirstFrameRevealWatchers();
+  hideDefaultAvatar();
+}
+
+function armFirstFrameReveal() {
+  if (!activeVideo || firstFrameRevealArmed) return;
+  firstFrameRevealArmed = true;
+
+  activeVideo.addEventListener('loadeddata', onFirstFrameMaybeVisible);
+  activeVideo.addEventListener('canplay', onFirstFrameMaybeVisible);
+  activeVideo.addEventListener('playing', onFirstFrameMaybeVisible);
+  activeVideo.addEventListener('timeupdate', onFirstFrameMaybeVisible);
+
+  if (typeof activeVideo.requestVideoFrameCallback === 'function') {
+    firstFrameRvfcToken = activeVideo.requestVideoFrameCallback(() => {
+      onFirstFrameMaybeVisible();
+    });
+  }
+
+  firstFrameFallbackTimer = setTimeout(() => {
+    onFirstFrameMaybeVisible();
+  }, 1200);
+}
+
+function pickMseCodec() {
+  for (const codec of MSE_CODEC_CANDIDATES) {
+    if (MediaSource.isTypeSupported(codec)) {
+      return codec;
+    }
+  }
+  return null;
+}
+
+function tryPlayVideo() {
+  if (!activeVideo) return;
+  if (!sourceBuffer || !sourceBuffer.buffered || sourceBuffer.buffered.length === 0) return;
+
+  const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+  const current = activeVideo.currentTime || 0;
+  if (end - current < MSE_START_BUFFER_SEC) return;
+
+  const p = activeVideo.play();
+  if (p && typeof p.catch === 'function') {
+    p.catch((e) => console.warn('[MSE] play error:', e));
+  }
+}
+
+function getBufferedAheadSec() {
+  if (!sourceBuffer || !sourceBuffer.buffered || sourceBuffer.buffered.length === 0 || !activeVideo) {
+    return 0;
+  }
+  const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+  const current = activeVideo.currentTime || 0;
+  return Math.max(0, end - current);
+}
+
+function trimOldBuffer() {
+  if (!sourceBuffer || sourceBuffer.updating || sourceBuffer.buffered.length === 0) return;
+  const current = activeVideo.currentTime || 0;
+  const keepFrom = Math.max(0, current - MSE_KEEP_BUFFER_SEC);
+  const start = sourceBuffer.buffered.start(0);
+  if (keepFrom > start + 0.5) {
+    try {
+      sourceBuffer.remove(0, keepFrom);
+    } catch (e) {
+      console.warn('[MSE] remove old buffer failed:', e);
+    }
+  }
+}
+
+function appendNextMseChunk() {
+  if (!mseOpened || !sourceBuffer || sourceBuffer.updating || mseAppending) return;
+  if (mseAppendQueue.length === 0) {
+    tryPlayVideo();
+    return;
+  }
+
+  mseAppending = true;
+  const chunk = mseAppendQueue.shift();
+  if (!chunk || chunk.generation !== mseGeneration) {
+    mseAppending = false;
+    appendNextMseChunk();
+    return;
+  }
+  try {
+    sourceBuffer.appendBuffer(chunk.bytes);
+  } catch (e) {
+    mseAppending = false;
+    mseConsecutiveAppendErrors += 1;
+    console.warn('[MSE] appendBuffer failed:', e);
+    if (chunk) mseAppendQueue.unshift(chunk);
+    if (mseConsecutiveAppendErrors >= MSE_MAX_APPEND_ERRORS) {
+      recoverMsePipeline('append-buffer-errors');
+    }
+  }
+}
+
+function enqueueMseChunk(mp4Data) {
+  if (!mp4Data || mp4Data.byteLength === 0) return;
+  if (!acceptIncomingMedia) return false;
+  mseLastChunkAt = Date.now();
+  firstChunkSeenGeneration = mseGeneration;
+  mseAppendQueue.push({
+    generation: mseGeneration,
+    bytes: new Uint8Array(mp4Data),
+  });
+  appendNextMseChunk();
+  return true;
+}
+
+function recoverMsePipeline(reason) {
+  if (mseRecovering) return;
+  if (!activeVideo) return;
+
+  mseRecovering = true;
+  console.warn('[MSE] recovering pipeline:', reason);
+
+  const keepAccepting = acceptIncomingMedia;
+  mseGeneration += 1;
+  firstChunkSeenGeneration = -1;
+  mseAppendQueue = [];
+  mseAppending = false;
+  mseConsecutiveAppendErrors = 0;
+  pendingTurnReset = false;
+
+  if (sourceBuffer && sourceBuffer.updating) {
+    try {
+      sourceBuffer.abort();
+    } catch (e) {
+      console.warn('[MSE] abort during recovery failed:', e);
+    }
+  }
+
+  buildMsePipeline();
+  acceptIncomingMedia = keepAccepting;
+  mseLastUpdateEndAt = Date.now();
+
+  setTimeout(() => {
+    mseRecovering = false;
+  }, 200);
+}
+
+function monitorMseHealth() {
+  if (!activeVideo || !sourceBuffer || !mseOpened) return;
+  if (!acceptIncomingMedia || pendingTurnReset) return;
+
+  const now = Date.now();
+  const bufferedAhead = getBufferedAheadSec();
+
+  if (sourceBuffer.updating && now - mseLastUpdateEndAt > MSE_UPDATE_STUCK_MS) {
+    recoverMsePipeline('sourcebuffer-updating-stuck');
+    return;
+  }
+
+  if (!sourceBuffer.updating && mseAppendQueue.length > 5 && now - mseLastUpdateEndAt > MSE_QUEUE_STUCK_MS) {
+    recoverMsePipeline('append-queue-stuck');
+    return;
+  }
+
+  if (!sourceBuffer.updating && !mseAppending && mseAppendQueue.length > 0 && bufferedAhead < 0.12) {
+    appendNextMseChunk();
+  }
+
+  const streamLikelyFinished = (
+    firstChunkSeenGeneration === mseGeneration
+    && !sourceBuffer.updating
+    && !mseAppending
+    && mseAppendQueue.length === 0
+    && bufferedAhead < 0.02
+    && now - mseLastChunkAt > MSE_STREAM_FINISHED_IDLE_MS
+  );
+
+  if (streamLikelyFinished) {
+    acceptIncomingMedia = false;
+    firstFrameRevealArmed = false;
+    clearFirstFrameRevealWatchers();
+    showDefaultAvatar();
+    if (!activeVideo.paused) {
+      activeVideo.pause();
+    }
+    return;
+  }
+
+  if (!activeVideo.paused && bufferedAhead < 0.06 && mseAppendQueue.length === 0 && now - mseLastChunkAt > 2500) {
+    recoverMsePipeline('buffer-underrun-without-new-chunks');
+  }
+}
+
+function startMseHealthMonitor() {
+  if (mseHealthTimer) return;
+  mseHealthTimer = setInterval(monitorMseHealth, MSE_HEALTH_CHECK_MS);
+}
+
+function buildMsePipeline() {
+  if (!activeVideo || typeof MediaSource === 'undefined') return false;
+  mseCodec = pickMseCodec();
+  if (!mseCodec) {
+    console.error('[MSE] no supported codec');
+    return false;
+  }
+
+  mediaSource = new MediaSource();
+  mseOpened = false;
+  sourceBuffer = null;
+  mseAppendQueue = [];
+  mseAppending = false;
+
+  if (mseObjectUrl) {
+    URL.revokeObjectURL(mseObjectUrl);
+    mseObjectUrl = null;
+  }
+  mseObjectUrl = URL.createObjectURL(mediaSource);
+  activeVideo.src = mseObjectUrl;
+  activeVideo.muted = false;
+  activeVideo.playsInline = true;
+
+  mediaSource.addEventListener('sourceopen', () => {
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer(mseCodec);
+      sourceBuffer.mode = 'sequence';
+      mseOpened = true;
+
+      sourceBuffer.addEventListener('updateend', () => {
+        mseAppending = false;
+        mseConsecutiveAppendErrors = 0;
+        mseLastUpdateEndAt = Date.now();
+        trimOldBuffer();
+        appendNextMseChunk();
+      });
+
+      sourceBuffer.addEventListener('error', (e) => {
+        mseAppending = false;
+        console.error('[MSE] SourceBuffer error:', e);
+        recoverMsePipeline('sourcebuffer-error-event');
+      });
+
+      appendNextMseChunk();
+    } catch (e) {
+      console.error('[MSE] sourceopen init failed:', e);
+    }
+  }, { once: true });
+
+  return true;
+}
+
+function preparePipelineForNewTurn() {
+  mseAppendQueue = [];
+  mseAppending = false;
+
+  if (sourceBuffer && sourceBuffer.updating) {
+    try {
+      sourceBuffer.abort();
+    } catch (e) {
+      console.warn('[MSE] abort failed:', e);
+    }
+  }
+
+  buildMsePipeline();
+}
+
+function stopPlaybackKeepFrame() {
+  if (activeVideo && !activeVideo.paused) {
+    activeVideo.pause();
+  }
+}
+
+function resetVideoState() {
+  firstFrameRevealArmed = false;
+  clearFirstFrameRevealWatchers();
+  mseGeneration += 1;
+  firstChunkSeenGeneration = -1;
+  acceptIncomingMedia = false;
+  pendingTurnReset = true;
+  mseAppendQueue = [];
+  mseAppending = false;
+  stopPlaybackKeepFrame();
+  showDefaultAvatar();
+}
+
+function hardResetVideoState() {
+  resetVideoState();
+  preparePipelineForNewTurn();
+  pendingTurnReset = false;
+}
+
+function handleMediaFrame(arrayBuffer) {
+  if (arrayBuffer.byteLength < 5) return;
+
+  const view = new DataView(arrayBuffer);
+  const type = view.getUint8(0);
+
+  if (type === 0x04) {
+    const mp4Len = view.getUint32(1, true);
+    if (arrayBuffer.byteLength < 5 + mp4Len) return;
+
+    const mp4Data = arrayBuffer.slice(5, 5 + mp4Len);
+    if (pendingTurnReset) {
+      preparePipelineForNewTurn();
+      pendingTurnReset = false;
+    }
+    const accepted = enqueueMseChunk(mp4Data);
+    if (accepted) {
+      armFirstFrameReveal();
+    }
+  }
+}
+
+buildMsePipeline();
+startMseHealthMonitor();
+
+if (activeVideo) {
+  activeVideo.addEventListener('ended', () => {
+    firstFrameRevealArmed = false;
+    clearFirstFrameRevealWatchers();
+    showDefaultAvatar();
+  });
 }
 
 // ==================== DOM elements ====================
@@ -103,8 +442,8 @@ const loadingSuccess = document.querySelector(".loading-success");
 socket.onmessage = (event) => {
   const data = event.data;
 
-  // 不再处理二进制音频（音频已通过 WebRTC 播放）
   if (data instanceof ArrayBuffer) {
+    handleMediaFrame(data);
     return;
   }
 
@@ -141,6 +480,11 @@ socket.onmessage = (event) => {
 
     case 'circle_status':
       updateCircleState(payload.status);
+      if (payload.status === 'SPEAKING') {
+        acceptIncomingMedia = true;
+      } else if (payload.status === 'LISTENING' || payload.status === 'READY') {
+        showDefaultAvatar();
+      }
       break;
 
     case 'user_transcription':
@@ -148,39 +492,12 @@ socket.onmessage = (event) => {
       break;
 
     case 'stop_audio':
-      // 数字人停止说话（由 FlashHead 端处理帧停止）
-      updateCircleState("LISTENING");
-      break;
-
-    // ── WebRTC 信令 ──────────────────────────────────────────────────────────
-
-    case 'webrtc_answer':
-      // 收到 FlashHead 的 answer，完成 WebRTC 握手
-      (async () => {
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription({
-            sdp: payload.sdp,
-            type: payload.type,
-          }));
-          console.log('[WebRTC] remote description set (answer)');
-        } catch (e) {
-          console.error('[WebRTC] setRemoteDescription error:', e);
-        }
-      })();
-      break;
-
-    case 'webrtc_candidate':
-      // 收到服务端的 ICE candidate（trickleless ICE 下通常不会收到）
-      if (pc && payload && payload.candidate) {
-        pc.addIceCandidate(new RTCIceCandidate(payload)).catch(e =>
-          console.warn('[WebRTC] addIceCandidate error:', e)
-        );
+      if (payload && payload.message === 'interrupt') {
+        hardResetVideoState();
+      } else {
+        resetVideoState();
       }
-      break;
-
-    case 'webrtc_error':
-      console.error('[WebRTC] server error:', payload.message);
-      videoPlaceholder.style.display = 'flex';
+      updateCircleState("LISTENING");
       break;
 
     default:
@@ -204,11 +521,9 @@ function handleVadLoading({ state, message }) {
   }
 }
 
-// 点击「Start Experience」后关闭 overlay，发起 WebRTC
-loadingConfirmBtn.addEventListener("click", async () => {
+loadingConfirmBtn.addEventListener("click", () => {
   loadingOverlay.classList.add("hidden");
   updateCircleState("READY");
-  await initWebRTC();
 });
 
 // ==================== Transcription ====================
@@ -231,12 +546,12 @@ function handleUserTranscription({ text }) {
 startBtn.addEventListener('click', async () => {
   try {
     listening = true;
+    acceptIncomingMedia = false;
     updateCircleState("LISTENING");
 
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
 
-    // 发送采样率配置
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({
         event: "config_audio",
@@ -252,9 +567,12 @@ startBtn.addEventListener('click', async () => {
     dataArray = new Uint8Array(analyser.frequencyBinCount);
 
     processor = audioContext.createScriptProcessor(512, 1, 1);
+    silentGain = audioContext.createGain();
+    silentGain.gain.value = 0;
     source.connect(analyser);
     source.connect(processor);
-    processor.connect(audioContext.destination);
+    processor.connect(silentGain);
+    silentGain.connect(audioContext.destination);
 
     processor.onaudioprocess = e => {
       if (!listening) return;
@@ -284,6 +602,8 @@ startBtn.addEventListener('click', async () => {
 stopBtn.addEventListener('click', () => {
   listening = false;
 
+  hardResetVideoState();
+
   if (socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ event: 'duplex_stop' }));
   }
@@ -291,6 +611,7 @@ stopBtn.addEventListener('click', () => {
   cancelAnimationFrame(animationId);
   if (stream) stream.getTracks().forEach(t => t.stop());
   if (processor) processor.disconnect();
+  if (silentGain) silentGain.disconnect();
   if (source) source.disconnect();
   voiceCircle.style.transform = 'scale(1)';
   ctx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
